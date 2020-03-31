@@ -51,6 +51,8 @@ struct pcm_worker {
 };
 
 static unsigned int verbose = 0;
+static bool list_bt_devices = false;
+static bool list_bt_pcms = false;
 static const char *pcm_device = "default";
 static bool ba_profile_a2dp = true;
 static bool ba_addr_any = false;
@@ -138,6 +140,7 @@ static int pause_device_player(const struct ba_pcm *ba_pcm) {
 	if ((rep = dbus_connection_send_with_reply_and_block(dbus_ctx.conn, msg,
 					DBUS_TIMEOUT_USE_DEFAULT, &err)) == NULL) {
 		warn("Couldn't pause player: %s", err.message);
+		dbus_error_free(&err);
 		goto fail;
 	}
 
@@ -152,7 +155,6 @@ final:
 		dbus_message_unref(msg);
 	if (rep != NULL)
 		dbus_message_unref(rep);
-
 	return ret;
 }
 
@@ -366,9 +368,11 @@ static int supervise_pcm_worker_start(struct ba_pcm *ba_pcm) {
 
 	workers_count++;
 	if (workers_size < workers_count) {
+		struct pcm_worker *tmp = workers;
 		workers_size += 4;  /* coarse-grained realloc */
 		if ((workers = realloc(workers, sizeof(*workers) * workers_size)) == NULL) {
 			error("Couldn't (re)allocate memory for PCM workers: %s", strerror(ENOMEM));
+			workers = tmp;
 			pthread_rwlock_unlock(&workers_lock);
 			return -1;
 		}
@@ -448,6 +452,9 @@ static DBusHandlerResult dbus_signal_handler(DBusConnection *conn, DBusMessage *
 	(void)conn;
 	(void)data;
 
+	if (dbus_message_get_type(message) != DBUS_MESSAGE_TYPE_SIGNAL)
+		return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
+
 	const char *path = dbus_message_get_path(message);
 	const char *interface = dbus_message_get_interface(message);
 	const char *signal = dbus_message_get_member(message);
@@ -458,8 +465,10 @@ static DBusHandlerResult dbus_signal_handler(DBusConnection *conn, DBusMessage *
 	if (strcmp(interface, BLUEALSA_INTERFACE_MANAGER) == 0) {
 
 		if (strcmp(signal, "PCMAdded") == 0) {
+			struct ba_pcm *tmp = ba_pcms;
 			if ((ba_pcms = realloc(ba_pcms, (ba_pcms_count + 1) * sizeof(*ba_pcms))) == NULL) {
 				error("Couldn't add new PCM: %s", strerror(ENOMEM));
+				ba_pcms = tmp;
 				goto fail;
 			}
 			if (!dbus_message_iter_init(message, &iter) ||
@@ -507,11 +516,13 @@ fail:
 int main(int argc, char *argv[]) {
 
 	int opt;
-	const char *opts = "hVvb:d:";
+	const char *opts = "hVvlLb:d:";
 	const struct option longopts[] = {
 		{ "help", no_argument, NULL, 'h' },
 		{ "version", no_argument, NULL, 'V' },
 		{ "verbose", no_argument, NULL, 'v' },
+		{ "list-devices", no_argument, NULL, 'l' },
+		{ "list-pcms", no_argument, NULL, 'L' },
 		{ "dbus", required_argument, NULL, 'b' },
 		{ "pcm", required_argument, NULL, 'd' },
 		{ "pcm-buffer-time", required_argument, NULL, 3 },
@@ -532,10 +543,12 @@ usage:
 					"  -h, --help\t\tprint this help and exit\n"
 					"  -V, --version\t\tprint version and exit\n"
 					"  -v, --verbose\t\tmake output more verbose\n"
+					"  -l, --list-devices\tlist all connected BT devices\n"
+					"  -L, --list-pcms\tlist all available BT PCMs\n"
 					"  -b, --dbus=NAME\tBlueALSA service name suffix\n"
-					"  -d, --pcm=NAME\tPCM device to use\n"
-					"  --pcm-buffer-time=INT\tPCM buffer time\n"
-					"  --pcm-period-time=INT\tPCM period time\n"
+					"  -d, --pcm=NAME\tplayback PCM device to use\n"
+					"  --pcm-buffer-time=INT\tplayback PCM buffer time\n"
+					"  --pcm-period-time=INT\tplayback PCM period time\n"
 					"  --profile-a2dp\tuse A2DP profile (default)\n"
 					"  --profile-sco\t\tuse SCO profile\n"
 					"  --single-audio\tsingle audio mode\n"
@@ -553,6 +566,13 @@ usage:
 
 		case 'v' /* --verbose */ :
 			verbose++;
+			break;
+
+		case 'l' /* --list-devices */ :
+			list_bt_devices = true;
+			break;
+		case 'L' /* --list-pcms */ :
+			list_bt_pcms = true;
 			break;
 
 		case 'b' /* --dbus=NAME */ :
@@ -585,10 +605,12 @@ usage:
 			return EXIT_FAILURE;
 		}
 
-	if (optind == argc)
+	if (optind == argc &&
+			!(list_bt_devices || list_bt_pcms))
 		goto usage;
 
 	log_open(argv[0], false, false);
+	dbus_threads_init_default();
 
 	size_t i;
 
@@ -604,6 +626,39 @@ usage:
 		}
 		if (bacmp(&ba_addrs[i], BDADDR_ANY) == 0)
 			ba_addr_any = true;
+	}
+
+	DBusError err = DBUS_ERROR_INIT;
+	if (!bluealsa_dbus_connection_ctx_init(&dbus_ctx, dbus_ba_service, &err)) {
+		error("Couldn't initialize D-Bus context: %s", err.message);
+		return EXIT_FAILURE;
+	}
+
+	if (list_bt_devices || list_bt_pcms) {
+
+		const char *tmp;
+		size_t i;
+
+		if (!bluealsa_dbus_get_pcms(&dbus_ctx, &ba_pcms, &ba_pcms_count, &err))
+			warn("Couldn't get BlueALSA PCM list: %s", err.message);
+
+		printf("**** List of PLAYBACK Bluetooth Devices ****\n");
+		for (i = 0, tmp = NULL; i < ba_pcms_count; i++)
+			if (ba_pcms[i].flags & BA_PCM_FLAG_SINK &&
+					(tmp == NULL || strcmp(ba_pcms[i].device_path, tmp) != 0)) {
+				printf("%s\n", ba_pcms[i].device_path);
+				tmp = ba_pcms[i].device_path;
+			}
+
+		printf("**** List of CAPTURE Bluetooth Devices ****\n");
+		for (i = 0, tmp = NULL; i < ba_pcms_count; i++)
+			if (ba_pcms[i].flags & BA_PCM_FLAG_SINK &&
+					(tmp == NULL || strcmp(ba_pcms[i].device_path, tmp) != 0)) {
+				printf("%s\n", ba_pcms[i].device_path);
+				tmp = ba_pcms[i].device_path;
+			}
+
+		return EXIT_SUCCESS;
 	}
 
 	if (verbose >= 1) {
@@ -628,14 +683,6 @@ usage:
 				ba_profile_a2dp ? "A2DP" : "SCO");
 
 		free(ba_str);
-	}
-
-	dbus_threads_init_default();
-
-	DBusError err = DBUS_ERROR_INIT;
-	if (!bluealsa_dbus_connection_ctx_init(&dbus_ctx, dbus_ba_service, &err)) {
-		error("Couldn't initialize D-Bus context: %s", err.message);
-		return EXIT_FAILURE;
 	}
 
 	bluealsa_dbus_connection_signal_match_add(&dbus_ctx,
